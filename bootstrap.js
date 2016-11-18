@@ -95,6 +95,13 @@
 			}
 		}
 	};
+	const eventMMListener = function(msg) {
+		var event = msg.data;
+		var timer = delay(function() {
+			Services.obs.notifyObservers(null, event.name, JSON.stringify(event));
+			timer = null;
+		}, 4444);
+	};
 	const XPCOMUtils = Import("XPCOMUtils");
 	const i$ = freeze({
 		onOpenWindow: function(aWindow) {
@@ -138,15 +145,25 @@
 			return uri;
 		},
 		newChannel: function(aURI) {
-			var uri;
+			return this.newChannel2(aURI, null);
+		},
+		newChannel2: function(aURI, aLoadInfo) {
+			let uri;
+			let channel;
 			if (aURI.path && (!aURI.schemeIs(this.scheme) || String(aURI.path).split('#').shift().replace(/\//g, ''))) {
 				uri = Services.io.newURI(megacuri, null, null);
 				uri = uri.resolve(aURI.path);
 			} else {
 				uri = megacuri + aURI.ref;
 			}
-			// LOG("newChannel: " + aURI.spec + " -> " + uri, aURI);
-			var channel = Services.io.newChannel(uri, null, null);
+			// LOG("newChannel2: " + aURI.spec + " -> " + uri, aURI, aLoadInfo);
+			if (aLoadInfo) {
+				uri = Services.io.newURI(uri, null, null);
+				channel = Services.io.newChannelFromURIWithLoadInfo(uri, aLoadInfo);
+			}
+			else {
+				channel = newChannel(uri);
+			}
 			channel.owner = mSystemPrincipal;
 			channel.originalURI = aURI;
 			return channel;
@@ -189,8 +206,10 @@
 							throw new Error('Resource blocked: ' + y.spec);
 					}
 				} catch(e) {
-					reportError(e);
-					return REJECT;
+					if (e.result != Cr.NS_ERROR_MALFORMED_URI) {
+						reportError(e);
+						return REJECT;
+					}
 				}
 				else if (~y.spec.indexOf(megacuri))
 				{
@@ -236,19 +255,47 @@
 	const getMMMsg = function(type) {
 		return 'a:' + mRID + ':' + type;
 	};
-	const register = function() {
+	const getPrincipalForFrame = function(docShell, frame) {
+		let ssm = Services.scriptSecurityManager;
+		let uri = frame.document.documentURIObject;
+		return ssm.getDocShellCodebasePrincipal(uri, docShell);
+	};
+	const getSessionStorage = function() {
 		try {
-			var registrar = Cm.QueryInterface(Ci.nsIComponentRegistrar);
-			registrar.registerFactory(i$.classID, i$.classDescription, i$.contractID, i$);
-		} catch (e) {
-			if(0xC1F30100 == e.result)
-				return later(register);
-			reportError(e);
+			let tmp = Cu.import('resource://app/modules/sessionstore/SessionStorage.jsm', {});
+			return tmp.SessionStorageInternal;
+		} catch(e) {}
+		
+		return false;
+	};
+	const register = function() {
+		let registrar;
+
+		if (addon.multiprocessCompatible) {
+			Services.ppmm.loadProcessScript('resource://mega/process-script.js?id=' + addon.psid, true);
+			try {
+				registrar = Cm.QueryInterface(Ci.nsIComponentRegistrar);
+				registrar.registerFactory(i$.phClassID, i$.scheme, i$.phContractID, i$);
+			} catch (e) {
+				if(0xC1F30100 == e.result)
+					return later(register);
+				reportError(e);
+			}
+		}
+		else {
+			try {
+				registrar = Cm.QueryInterface(Ci.nsIComponentRegistrar);
+				registrar.registerFactory(i$.phClassID, i$.scheme, i$.phContractID, i$);
+				registrar.registerFactory(i$.classID, i$.classDescription, i$.contractID, i$);
+			} catch (e) {
+				if(0xC1F30100 == e.result)
+					return later(register);
+				reportError(e);
+			}
+
+			Services.cm.addCategoryEntry('content-policy', i$.classDescription, i$.contractID, false, true);
 		}
 
-		Services.cm.addCategoryEntry('content-policy', i$.classDescription, i$.contractID, false, true);
-		registrar.registerFactory(i$.phClassID, i$.scheme, i$.phContractID, i$);
-		
 		var i = Ci.nsITimer, uCheckTimer = Cc["@mozilla.org/timer;1"].createInstance(i);
 		uCheckTimer.initWithCallback({
 			notify: function() {
@@ -262,49 +309,79 @@
 		},3600000,i.TYPE_REPEATING_SLACK);
 		
 		if (globalMM) {
+			globalMM.addMessageListener("MEGA:"+mRID+":event", eventMMListener);
 			globalMM.addMessageListener("MEGA:"+mRID+":loadURI", globalMMListener);
 			globalMM.loadFrameScript(chromens+'e10s.js?rev='+mRID,true);
 		}
 		
-		const __sbbr = E10SUtils && E10SUtils.shouldBrowserBeRemote;
-		if (typeof __sbbr === 'function') {
+		const shouldBrowserBeRemote = E10SUtils && E10SUtils.shouldBrowserBeRemote;
+		if (typeof shouldBrowserBeRemote === 'function') {
 			E10SUtils.shouldBrowserBeRemote = function(aURL) {
 				var url = '' + aURL;
 				if (url.substr(0,chromens.length) == chromens || url.substr(0,5) == 'mega:')
 					return false;
-				return __sbbr.apply(E10SUtils, arguments);
+				return shouldBrowserBeRemote.apply(E10SUtils, arguments);
 			};
 		}
-		const __cluip = E10SUtils && E10SUtils.canLoadURIInProcess;
-		if (typeof __cluip === 'function') {
+		const canLoadURIInProcess = E10SUtils && E10SUtils.canLoadURIInProcess;
+		if (typeof canLoadURIInProcess === 'function') {
 			E10SUtils.canLoadURIInProcess = function(aURL, aProcess) {
 				var url = '' + aURL;
 				if (url.substr(0,chromens.length) == chromens || url.substr(0,5) == 'mega:')
 					return aProcess !== Ci.nsIXULRuntime.PROCESS_TYPE_CONTENT;
-				return __cluip.apply(E10SUtils, arguments);
+				return canLoadURIInProcess.apply(E10SUtils, arguments);
 			};
 		}
-		
+		// Workaround Bug 1247529
+		const SessionStorageInternal = getSessionStorage();
+		const ssCollect = SessionStorageInternal.collect;
+		SessionStorageInternal.collect = function(aDocShell, aFrameTree) {
+			let frameTree = [];
+			aFrameTree.forEach(function(frame) {
+				try {
+					getPrincipalForFrame(aDocShell, frame).origin;
+					frameTree.push(frame);
+				}
+				catch (e) {}
+			});
+
+			return ssCollect.call(SessionStorageInternal, aDocShell, frameTree);
+		};
+
 		shutdown(function() {
 			uCheckTimer.cancel();
 
-			later(function() {
-				registrar.unregisterFactory(i$.phClassID, i$);
-				registrar.unregisterFactory(i$.classID, i$);
-			});
+			if (addon.multiprocessCompatible) {
+				Services.ppmm.broadcastAsyncMessage('mega:' + addon.psid, 'shutdown');
+				Services.ppmm.removeDelayedProcessScript('resource://mega/process-script.js?id=' + addon.psid);
 
-			Services.cm.deleteCategoryEntry('content-policy', i$.classDescription, false);
-			
+				later(function() {
+					registrar.unregisterFactory(i$.phClassID, i$);
+				});
+			}
+			else {
+				later(function() {
+					registrar.unregisterFactory(i$.phClassID, i$);
+					registrar.unregisterFactory(i$.classID, i$);
+				});
+
+				Services.cm.deleteCategoryEntry('content-policy', i$.classDescription, false);
+			}
+
 			if (globalMM) {
 				globalMM.broadcastAsyncMessage("MEGA:"+mRID+":bcast",getMMMsg('d'));
+				globalMM.removeMessageListener("MEGA:"+mRID+":event", eventMMListener);
 				globalMM.removeMessageListener("MEGA:"+mRID+":loadURI", globalMMListener);
 				globalMM.removeDelayedFrameScript(chromens+'e10s.js?rev='+mRID);
 			}
-			if (typeof __sbbr === 'function') {
-				E10SUtils.shouldBrowserBeRemote = __sbbr;
+			if (typeof shouldBrowserBeRemote === 'function') {
+				E10SUtils.shouldBrowserBeRemote = shouldBrowserBeRemote;
 			}
-			if (typeof __cluip === 'function') {
-				E10SUtils.canLoadURIInProcess = __cluip;
+			if (typeof canLoadURIInProcess === 'function') {
+				E10SUtils.canLoadURIInProcess = canLoadURIInProcess;
+			}
+			if (typeof ssCollect === 'function') {
+				SessionStorageInternal.collect = ssCollect;
 			}
 		});
 	};
@@ -335,15 +412,19 @@
 
 			addon = aAddon;
 			Object.defineProperty(addon, 'tag', { value: tag });
+			Object.defineProperty(addon, 'psid', {
+				configurable: true,
+				value: addon.id.replace(/[^\w-]/g, '') + mRID
+			});
 
 			// DBG = LOG;//addon.version.replace(/[\d.]/g,'') == 'a' ? LOG:Vf;
 			// DBG(Gs, addon, Services, i$);
 
-			register();
-
 			Services.io.getProtocolHandler("resource")
 				.QueryInterface(Ci.nsIResProtocolHandler)
 				.setSubstitution(addon.tag,aData.resourceURI);
+
+			register();
 
 			wmf(loadIntoWindow);
 			Services.wm.addListener(i$);
@@ -394,17 +475,32 @@
 	const Services = extend(create(Import("Services")), freeze({
 		cm : Cc["@mozilla.org/categorymanager;1"].getService(Ci.nsICategoryManager)
 	}));
+	const newChannel = (function() {
+		if (typeof Services.io.newChannel2 !== 'function') {
+			return function(aSpec) {
+				return Services.io.newChannel(aSpec, null, null);
+			};
+		}
+		return function(aSpec) {
+			return Services.io.newChannel2(
+				aSpec,
+				'UTF-8',
+				null, null, mSystemPrincipal, null,
+				Ci.nsILoadInfo.SEC_ALLOW_CROSS_ORIGIN_DATA_IS_NULL,
+				Ci.nsIContentPolicy.TYPE_DOCUMENT);
+		};
+	})();
 	var DBG, console, addon = {};
 
 	/**
 	try {
 		console = Import("devtools/Console").console;
 	} catch(e) {
-		console = { log : function(n,m) { Services.console.logStringMessage(m||n)}};
+		console = { info : function(n,m) { Services.console.logStringMessage(m||n)}};
 	}
 	const LOG = function() {
 		[].unshift.call(arguments,addon.name);
-		console.log.apply(console, arguments);
+		console.info.apply(console, arguments);
 		DBG == Vf || console.trace();
 	}; /**/
 
