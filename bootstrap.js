@@ -75,22 +75,28 @@
 		if("gBrowser" in aWindow)
 			return aWindow.gBrowser;
 
-		return aWindow.BrowserApp.deck;
+		return aWindow.BrowserApp && aWindow.BrowserApp.deck;
 	};
 	const shutdown = function(func) {
 		SQ.push(func);
 	};
 	const globalMMListener = function(msg) {
-		// LOG(msg.name + ' ~~ ' + msg.data);
+		// LOG(msg.name + ' ~~ ' + msg.data, msg);
 		if (msg.data.substr(0,5) === 'mega:') {
 			var browser = msg.target;
 			if (browser.ownerGlobal) {
-				// browser.ownerGlobal.loadURI(msg.data);
-				var gBrowser = getBrowser(browser.ownerGlobal);
-				if (gBrowser) {
-					if (typeof gBrowser.updateBrowserRemoteness === 'function')
-						gBrowser.updateBrowserRemoteness(browser, false);
-					browser.loadURIWithFlags(msg.data, 0x80|0x800,null,null,null);
+				if (typeof browser.ownerGlobal._loadURIWithFlags === 'function') {
+					browser.ownerGlobal._loadURIWithFlags(browser, msg.data, { flags: 0x80 | 0x800 });
+				}
+				else {
+					var gBrowser = getBrowser(browser.ownerGlobal);
+					if (gBrowser) {
+						if (typeof gBrowser.updateBrowserRemoteness === 'function') {
+							gBrowser.updateBrowserRemoteness(browser, false);
+						}
+						browser.loadURIWithFlags(msg.data, 0x80|0x800,null,null,null);
+						// LOG('loadURIWithFlags', msg.data);
+					}
 				}
 			}
 		}
@@ -152,7 +158,7 @@
 			let channel;
 			if (aURI.path && (!aURI.schemeIs(this.scheme) || String(aURI.path).split('#').shift().replace(/\//g, ''))) {
 				uri = Services.io.newURI(megacuri, null, null);
-				uri = uri.resolve(aURI.path);
+				uri = uri.resolve(String(aURI.path).replace(/^\//, ''));
 			} else {
 				uri = megacuri + aURI.ref;
 			}
@@ -163,6 +169,12 @@
 			}
 			else {
 				channel = newChannel(uri);
+			}
+			if (aURI.schemeIs(this.scheme) && ~String(aURI.spec).indexOf(':/')) {
+				try {
+					aURI.spec = aURI.spec.replace(RegExp('^' + this.scheme + ':\\/+', 'i'), this.scheme + ':');
+				}
+				catch (ex) {}
 			}
 			channel.owner = mSystemPrincipal;
 			channel.originalURI = aURI;
@@ -188,15 +200,18 @@
 			"mega.nz"    : 1,
 		},
 		shouldLoad: function(x,y,z,n,m,t,p) {
+			// return ACCEPT;
 			if (y.schemeIs("http") || y.schemeIs("https")) {
+				// if(this._hosts[y.host]) LOG('shouldLoad', y.path, y.spec, y);
 				
-				if(this._hosts[y.host] && y.path.split('#')[0] === '/') try {
+				if(this._hosts[y.host] && !~String(y.path).indexOf('.') && String(y.path).substr(0,6) !== '/linux') try {
 					switch(x) {
 						case 6:
 							if(~JSON.stringify(Components.stack).indexOf('"dch_handle"')) break;
 						case 7:
-							// y.spec = megacuri + y.ref;
-							y.spec = this.scheme + ':' + (y.hasRef ? '#' + y.ref : '');
+							y.spec = this.scheme + ':'
+										+ (y.hasRef ? '#' + y.ref
+										: (y.path ? '#' + String(y.path).replace(/^[/#]+/, '') : ''));
 							break;
 						case 3:
 						case 4:
@@ -272,7 +287,7 @@
 		let registrar;
 
 		if (addon.multiprocessCompatible) {
-			Services.ppmm.loadProcessScript('resource://mega/process-script.js?id=' + addon.psid, true);
+			// Services.ppmm.loadProcessScript('resource://mega/process-script.js?id=' + addon.psid, true);
 			try {
 				registrar = Cm.QueryInterface(Ci.nsIComponentRegistrar);
 				registrar.registerFactory(i$.phClassID, i$.scheme, i$.phContractID, i$);
@@ -332,6 +347,23 @@
 				return canLoadURIInProcess.apply(E10SUtils, arguments);
 			};
 		}
+		const getRemoteTypeForURI = E10SUtils && E10SUtils.getRemoteTypeForURI;
+		if (typeof getRemoteTypeForURI === 'function') {
+			E10SUtils.getRemoteTypeForURI = function(aURL, aMultiProcess, aPreferredRemoteType) {
+				var url = '' + aURL;
+				if (url.substr(0,chromens.length) == chromens || url.substr(0,5) == 'mega:')
+					return E10SUtils.NOT_REMOTE !== undefined ? E10SUtils.NOT_REMOTE : null;
+				return getRemoteTypeForURI.apply(E10SUtils, arguments);
+			};
+		}
+		const getRemoteTypeForURIObject = E10SUtils && E10SUtils.getRemoteTypeForURIObject;
+		if (typeof getRemoteTypeForURIObject === 'function') {
+			E10SUtils.getRemoteTypeForURIObject = function(aURI, aMultiProcess, aPreferredRemoteType) {
+				if (String(aURI.spec).substr(0,chromens.length) == chromens || aURI.scheme == 'mega')
+					return E10SUtils.NOT_REMOTE !== undefined ? E10SUtils.NOT_REMOTE : null;
+				return getRemoteTypeForURIObject.apply(E10SUtils, arguments);
+			};
+		}
 		// Workaround Bug 1247529
 		const SessionStorageInternal = getSessionStorage();
 		const ssCollect = SessionStorageInternal.collect;
@@ -352,8 +384,8 @@
 			uCheckTimer.cancel();
 
 			if (addon.multiprocessCompatible) {
-				Services.ppmm.broadcastAsyncMessage('mega:' + addon.psid, 'shutdown');
-				Services.ppmm.removeDelayedProcessScript('resource://mega/process-script.js?id=' + addon.psid);
+				// Services.ppmm.broadcastAsyncMessage('mega:' + addon.psid, 'shutdown');
+				// Services.ppmm.removeDelayedProcessScript('resource://mega/process-script.js?id=' + addon.psid);
 
 				later(function() {
 					registrar.unregisterFactory(i$.phClassID, i$);
@@ -379,6 +411,12 @@
 			}
 			if (typeof canLoadURIInProcess === 'function') {
 				E10SUtils.canLoadURIInProcess = canLoadURIInProcess;
+			}
+			if (typeof getRemoteTypeForURI === 'function') {
+				E10SUtils.getRemoteTypeForURI = getRemoteTypeForURI;
+			}
+			if (typeof getRemoteTypeForURIObject === 'function') {
+				E10SUtils.getRemoteTypeForURIObject = getRemoteTypeForURIObject;
 			}
 			if (typeof ssCollect === 'function') {
 				SessionStorageInternal.collect = ssCollect;
